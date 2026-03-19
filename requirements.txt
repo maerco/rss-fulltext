@@ -4,3 +4,4 @@ httpx
 trafilatura
 cachetools
 gunicorn
+beautifulsoup4
