@@ -74,7 +74,6 @@ def extract_with_beautifulsoup(soup: BeautifulSoup) -> str:
     for selector in CONTENT_SELECTORS:
         el = soup.select_one(selector)
         if el:
-            # Rimuove elementi inutili
             for tag in el.select("script, style, .sharedaddy, .jp-relatedposts, "
                                   ".post-tags, .post-categories, nav, .navigation, "
                                   ".comments-area, .sidebar, [class*='related'], "
@@ -92,14 +91,12 @@ def fetch_full_text(url: str, cover_url: str = "") -> str:
                          headers={"User-Agent": "Mozilla/5.0 (RSS fulltext fetcher)"})
         soup = BeautifulSoup(resp.text, "html.parser")
 
-        # og:image come fallback copertina
         if not cover_url:
             cover_url = fetch_og_image(soup)
 
         soup = fix_lazy_images(soup)
         fixed_html = str(soup)
 
-        # Prova prima trafilatura
         content = trafilatura.extract(
             fixed_html,
             output_format="html",
@@ -109,11 +106,9 @@ def fetch_full_text(url: str, cover_url: str = "") -> str:
             no_fallback=False
         )
 
-        # Se trafilatura non trova niente o trova poco, usa BeautifulSoup
         if not content or len(content) < 200:
             content = extract_with_beautifulsoup(soup)
 
-        # Aggiunge copertina in cima se non già presente
         if content and cover_url and cover_url not in content:
             cover_tag = f'<img src="{cover_url}" style="max-width:100%;margin-bottom:1em;" />'
             content = cover_tag + content
@@ -122,8 +117,8 @@ def fetch_full_text(url: str, cover_url: str = "") -> str:
     except Exception:
         return ""
 
-def build_full_feed(feed_url: str) -> str:
-    if feed_url in cache:
+def build_full_feed(feed_url: str, force_refresh: bool = False) -> str:
+    if not force_refresh and feed_url in cache:
         return cache[feed_url]
 
     feed = feedparser.parse(feed_url)
@@ -139,7 +134,6 @@ def build_full_feed(feed_url: str) -> str:
 
         existing = entry.get("content", [{}])[0].get("value", "") or entry.get("summary", "")
 
-        # Soglia 200 caratteri: sotto questa soglia vale la pena scrapare
         if len(BeautifulSoup(existing, "html.parser").get_text(strip=True)) > 200:
             content = existing
             if cover_url and cover_url not in content:
@@ -148,7 +142,6 @@ def build_full_feed(feed_url: str) -> str:
         else:
             content = fetch_full_text(link, cover_url) or existing
 
-        # Sommario testuale per <description>
         plain_text = BeautifulSoup(content, "html.parser").get_text(" ", strip=True)
         summary = plain_text[:300] + "..." if len(plain_text) > 300 else plain_text
 
@@ -180,15 +173,17 @@ def index():
     return """
     <h2>RSS Full Text Service</h2>
     <p>Uso: <code>/feed?url=https://example.com/feed.xml</code></p>
+    <p>Forza aggiornamento cache: <code>/feed?url=https://example.com/feed.xml&amp;refresh=1</code></p>
     """
 
 @app.route("/feed")
 def full_feed():
     url = request.args.get("url")
+    force_refresh = request.args.get("refresh", "0") == "1"
     if not url:
         return Response("Parametro ?url= mancante", status=400)
     try:
-        xml = build_full_feed(url)
+        xml = build_full_feed(url, force_refresh)
         return Response(xml, mimetype="application/rss+xml")
     except Exception as e:
         return Response(f"Errore: {str(e)}", status=500)
