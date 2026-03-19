@@ -9,22 +9,71 @@ from bs4 import BeautifulSoup
 app = Flask(__name__)
 cache = TTLCache(maxsize=50, ttl=1800)  # 30 minuti di cache
 
-def fetch_og_image(soup: BeautifulSoup) -> str:
-    """Estrae l'immagine di copertina dai meta tag og:image."""
-    og = soup.find("meta", property="og:image")
-    if og and og.get("content"):
-        return f'<img src="{og["content"]}" style="max-width:100%;margin-bottom:1em;" />'
+def get_entry_image(entry) -> str:
+    """Estrae l'immagine dall'entry del feed (media:thumbnail, enclosure, og:image)."""
+    # 1. media:thumbnail (Wired e molti altri)
+    media_thumbnail = entry.get("media_thumbnail")
+    if media_thumbnail and isinstance(media_thumbnail, list):
+        url = media_thumbnail[0].get("url", "")
+        if url:
+            return url
+
+    # 2. media:content con url
+    media_content = entry.get("media_content")
+    if media_content and isinstance(media_content, list):
+        url = media_content[0].get("url", "")
+        if url and any(ext in url.lower() for ext in [".jpg", ".jpeg", ".png", ".webp", ".gif"]):
+            return url
+
+    # 3. enclosure (podcast/standard RSS)
+    enclosures = entry.get("enclosures", [])
+    for enc in enclosures:
+        if enc.get("type", "").startswith("image/"):
+            return enc.get("url", "")
+
     return ""
 
-def fetch_full_text(url: str) -> str:
+def fetch_og_image(soup: BeautifulSoup) -> str:
+    """Fallback: estrae og:image dalla pagina."""
+    og = soup.find("meta", property="og:image")
+    if og and og.get("content"):
+        return og["content"]
+    return ""
+
+def fix_lazy_images(soup: BeautifulSoup) -> BeautifulSoup:
+    """Sostituisce attributi lazy-load con src standard."""
+    lazy_attrs = ["data-src", "data-lazy-src", "data-original",
+                  "data-url", "data-image", "data-hi-res-src"]
+    for img in soup.find_all("img"):
+        for attr in lazy_attrs:
+            val = img.get(attr)
+            if val and val.startswith("http"):
+                img["src"] = val
+                break
+        if not img.get("src") or "placeholder" in img.get("src", ""):
+            srcset = img.get("srcset") or img.get("data-srcset", "")
+            if srcset:
+                first_url = srcset.strip().split()[0]
+                if first_url.startswith("http"):
+                    img["src"] = first_url
+    return soup
+
+def fetch_full_text(url: str, cover_url: str = "") -> str:
+    """Scarica la pagina ed estrae il testo completo in HTML."""
     try:
         resp = httpx.get(url, timeout=10, follow_redirects=True,
                          headers={"User-Agent": "Mozilla/5.0 (RSS fulltext fetcher)"})
         soup = BeautifulSoup(resp.text, "html.parser")
-        og_image = fetch_og_image(soup)
+
+        # Fallback og:image se non abbiamo già un'immagine dal feed
+        if not cover_url:
+            cover_url = fetch_og_image(soup)
+
+        soup = fix_lazy_images(soup)
+        fixed_html = str(soup)
 
         content = trafilatura.extract(
-            resp.text,
+            fixed_html,
             output_format="html",
             include_comments=False,
             include_tables=True,
@@ -32,10 +81,10 @@ def fetch_full_text(url: str) -> str:
             no_fallback=False
         )
 
-        if content and og_image:
-            # Inserisce la copertina prima del testo se non è già presente
-            if og_image.split('src="')[1].split('"')[0] not in content:
-                content = og_image + content
+        # Prepend immagine di copertina se disponibile e non già presente
+        if content and cover_url and cover_url not in content:
+            cover_tag = f'<img src="{cover_url}" style="max-width:100%;margin-bottom:1em;" />'
+            content = cover_tag + content
 
         return content or ""
     except Exception:
@@ -48,19 +97,27 @@ def build_full_feed(feed_url: str) -> str:
     feed = feedparser.parse(feed_url)
 
     items_xml = []
-    for entry in feed.entries[:20]:  # max 20 articoli
-        title   = entry.get("title", "")
-        link    = entry.get("link", "")
-        pub     = entry.get("published", datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000"))
+    for entry in feed.entries[:20]:
+        title = entry.get("title", "")
+        link  = entry.get("link", "")
+        pub   = entry.get("published",
+                          datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000"))
 
-        # Controlla se il contenuto è già completo (> 500 caratteri)
+        # Immagine dal feed (media:thumbnail ecc.)
+        cover_url = get_entry_image(entry)
+
+        # Contenuto: se già completo (> 500 chars) lo usiamo, altrimenti scarichiamo
         existing = entry.get("content", [{}])[0].get("value", "") or entry.get("summary", "")
         if len(existing) > 500:
             content = existing
+            # Aggiunge comunque la copertina se non è già nell'HTML
+            if cover_url and cover_url not in content:
+                cover_tag = f'<img src="{cover_url}" style="max-width:100%;margin-bottom:1em;" />'
+                content = cover_tag + content
         else:
-            content = fetch_full_text(link) or existing
+            content = fetch_full_text(link, cover_url) or existing
 
-        # Sommario breve per <description> (primi 300 caratteri del testo)
+        # Sommario testuale per <description>
         soup_content = BeautifulSoup(content, "html.parser")
         plain_text = soup_content.get_text(" ", strip=True)
         summary = plain_text[:300] + "..." if len(plain_text) > 300 else plain_text
