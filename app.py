@@ -9,7 +9,6 @@ from bs4 import BeautifulSoup
 app = Flask(__name__)
 cache = TTLCache(maxsize=50, ttl=1800)  # 30 minuti di cache
 
-# Selettori CSS per il contenuto principale (WordPress e siti comuni)
 CONTENT_SELECTORS = [
     "article .entry-content",
     "article .post-content",
@@ -23,8 +22,14 @@ CONTENT_SELECTORS = [
     "[itemprop='articleBody']",
 ]
 
+JUNK_SELECTORS = (
+    "script, style, .sharedaddy, .jp-relatedposts, .post-tags, "
+    ".post-categories, nav, .navigation, .comments-area, .sidebar, "
+    "[class*='related'], [class*='social'], [class*='share'], "
+    "[class*='newsletter'], [class*='subscribe'], [class*='widget']"
+)
+
 def get_entry_image(entry) -> str:
-    """Estrae l'immagine dall'entry del feed (media:thumbnail, enclosure, og:image)."""
     media_thumbnail = entry.get("media_thumbnail")
     if media_thumbnail and isinstance(media_thumbnail, list):
         url = media_thumbnail[0].get("url", "")
@@ -45,14 +50,12 @@ def get_entry_image(entry) -> str:
     return ""
 
 def fetch_og_image(soup: BeautifulSoup) -> str:
-    """Estrae og:image dalla pagina."""
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
         return og["content"]
     return ""
 
 def fix_lazy_images(soup: BeautifulSoup) -> BeautifulSoup:
-    """Sostituisce attributi lazy-load con src standard."""
     lazy_attrs = ["data-src", "data-lazy-src", "data-original",
                   "data-url", "data-image", "data-hi-res-src"]
     for img in soup.find_all("img"):
@@ -70,22 +73,17 @@ def fix_lazy_images(soup: BeautifulSoup) -> BeautifulSoup:
     return soup
 
 def extract_with_beautifulsoup(soup: BeautifulSoup) -> str:
-    """Fallback: estrae il contenuto usando selettori CSS comuni (WordPress ecc.)."""
     for selector in CONTENT_SELECTORS:
         el = soup.select_one(selector)
         if el:
-            for tag in el.select("script, style, .sharedaddy, .jp-relatedposts, "
-                                  ".post-tags, .post-categories, nav, .navigation, "
-                                  ".comments-area, .sidebar, [class*='related'], "
-                                  "[class*='social'], [class*='share']"):
+            for tag in el.select(JUNK_SELECTORS):
                 tag.decompose()
-            html = str(el)
-            if len(el.get_text(strip=True)) > 100:
-                return html
+            text = el.get_text(strip=True)
+            if len(text) > 50:  # soglia bassa: anche articoli brevissimi
+                return str(el)
     return ""
 
 def fetch_full_text(url: str, cover_url: str = "") -> str:
-    """Scarica la pagina ed estrae il testo completo in HTML."""
     try:
         resp = httpx.get(url, timeout=10, follow_redirects=True,
                          headers={"User-Agent": "Mozilla/5.0 (RSS fulltext fetcher)"})
@@ -95,20 +93,23 @@ def fetch_full_text(url: str, cover_url: str = "") -> str:
             cover_url = fetch_og_image(soup)
 
         soup = fix_lazy_images(soup)
-        fixed_html = str(soup)
 
-        content = trafilatura.extract(
-            fixed_html,
-            output_format="html",
-            include_comments=False,
-            include_tables=True,
-            include_images=True,
-            no_fallback=False
-        )
+        # Prima prova con BeautifulSoup diretto (più affidabile per siti con
+        # articoli brevi che trafilatura tende a scartare)
+        content = extract_with_beautifulsoup(soup)
 
-        if not content or len(content) < 200:
-            content = extract_with_beautifulsoup(soup)
+        # Se BeautifulSoup non trova niente, prova trafilatura come fallback
+        if not content:
+            content = trafilatura.extract(
+                str(soup),
+                output_format="html",
+                include_comments=False,
+                include_tables=True,
+                include_images=True,
+                no_fallback=False
+            ) or ""
 
+        # Aggiunge copertina in cima se non già presente nel contenuto
         if content and cover_url and cover_url not in content:
             cover_tag = f'<img src="{cover_url}" style="max-width:100%;margin-bottom:1em;" />'
             content = cover_tag + content
@@ -133,14 +134,17 @@ def build_full_feed(feed_url: str, force_refresh: bool = False) -> str:
         cover_url = get_entry_image(entry)
 
         existing = entry.get("content", [{}])[0].get("value", "") or entry.get("summary", "")
+        existing_text = BeautifulSoup(existing, "html.parser").get_text(strip=True)
 
-        if len(BeautifulSoup(existing, "html.parser").get_text(strip=True)) > 200:
-            content = existing
-            if cover_url and cover_url not in content:
-                cover_tag = f'<img src="{cover_url}" style="max-width:100%;margin-bottom:1em;" />'
-                content = cover_tag + content
-        else:
-            content = fetch_full_text(link, cover_url) or existing
+        # Scrapa sempre: anche se il feed ha del testo, potrebbe essere troncato.
+        # Usiamo il contenuto del feed solo se lo scraping fallisce completamente.
+        scraped = fetch_full_text(link, cover_url)
+        content = scraped if scraped else existing
+
+        # Se il feed ha un'immagine e non è già nel contenuto, aggiungila
+        if cover_url and cover_url not in content:
+            cover_tag = f'<img src="{cover_url}" style="max-width:100%;margin-bottom:1em;" />'
+            content = cover_tag + content
 
         plain_text = BeautifulSoup(content, "html.parser").get_text(" ", strip=True)
         summary = plain_text[:300] + "..." if len(plain_text) > 300 else plain_text
