@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: rss-fulltext
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    plan: free
+```
+
+---
+
+## Deploy su Render.com — istruzioni passo passo
+
+**1. Crea il repository su GitHub**
+- Vai su [github.com](https://github.com) → *New repository*
+- Chiama il repo `rss-fulltext`, rendilo pubblico
+- Carica i tre file (`app.py`, `requirements.txt`, `render.yaml`)
+
+**2. Crea un account su Render**
+- Vai su [render.com](https://render.com) e registrati (gratis, basta l'email)
+
+**3. Crea il servizio web**
+- Dashboard → **New +** → **Web Service**
+- Connetti il tuo account GitHub e seleziona il repo `rss-fulltext`
+- Render rileva automaticamente Python
+
+**4. Configura il servizio**
+- *Name*: `rss-fulltext` (o quello che vuoi)
+- *Region*: Frankfurt (EU, più veloce dall'Italia)
+- *Build Command*: `pip install -r requirements.txt`
+- *Start Command*: `gunicorn app:app`
+- *Plan*: **Free**
+- Clicca **Create Web Service**
+
+**5. Aspetta il deploy** (2-3 minuti la prima volta)
+
+Il servizio sarà disponibile su un URL tipo:
+`https://rss-fulltext-xxxx.onrender.com`
+
+---
+
+## Come si usa
+
+Una volta online, per ottenere il feed completo di qualsiasi RSS parziale basta puntare il tuo feed reader a:
+```
+https://rss-fulltext-xxxx.onrender.com/feed?url=https://esempio.com/feed.rss

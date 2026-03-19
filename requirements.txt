@@ -1,0 +1,6 @@
+flask
+feedparser
+httpx
+trafilatura
+cachetools
+gunicorn
