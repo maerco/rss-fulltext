@@ -1,3 +1,4 @@
+import asyncio
 import feedparser
 import httpx
 import trafilatura
@@ -7,7 +8,7 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 
 app = Flask(__name__)
-cache = TTLCache(maxsize=50, ttl=1800)  # 30 minuti di cache
+cache = TTLCache(maxsize=50, ttl=1800)
 
 CONTENT_SELECTORS = [
     "article .entry-content",
@@ -26,7 +27,9 @@ JUNK_SELECTORS = (
     "script, style, .sharedaddy, .jp-relatedposts, .post-tags, "
     ".post-categories, nav, .navigation, .comments-area, .sidebar, "
     "[class*='related'], [class*='social'], [class*='share'], "
-    "[class*='newsletter'], [class*='subscribe'], [class*='widget']"
+    "[class*='newsletter'], [class*='subscribe'], [class*='widget'], "
+    "[class*='adv'], [class*='ad-'], [class*='banner'], [class*='promo'], "
+    "aside, footer, header"
 )
 
 def get_entry_image(entry) -> str:
@@ -78,15 +81,13 @@ def extract_with_beautifulsoup(soup: BeautifulSoup) -> str:
         if el:
             for tag in el.select(JUNK_SELECTORS):
                 tag.decompose()
-            text = el.get_text(strip=True)
-            if len(text) > 50:  # soglia bassa: anche articoli brevissimi
+            if len(el.get_text(strip=True)) > 50:
                 return str(el)
     return ""
 
-def fetch_full_text(url: str, cover_url: str = "") -> str:
+async def fetch_full_text_async(client: httpx.AsyncClient, url: str, cover_url: str = "") -> str:
     try:
-        resp = httpx.get(url, timeout=10, follow_redirects=True,
-                         headers={"User-Agent": "Mozilla/5.0 (RSS fulltext fetcher)"})
+        resp = await client.get(url, timeout=8, follow_redirects=True)
         soup = BeautifulSoup(resp.text, "html.parser")
 
         if not cover_url:
@@ -94,11 +95,8 @@ def fetch_full_text(url: str, cover_url: str = "") -> str:
 
         soup = fix_lazy_images(soup)
 
-        # Prima prova con BeautifulSoup diretto (più affidabile per siti con
-        # articoli brevi che trafilatura tende a scartare)
         content = extract_with_beautifulsoup(soup)
 
-        # Se BeautifulSoup non trova niente, prova trafilatura come fallback
         if not content:
             content = trafilatura.extract(
                 str(soup),
@@ -109,7 +107,6 @@ def fetch_full_text(url: str, cover_url: str = "") -> str:
                 no_fallback=False
             ) or ""
 
-        # Aggiunge copertina in cima se non già presente nel contenuto
         if content and cover_url and cover_url not in content:
             cover_tag = f'<img src="{cover_url}" style="max-width:100%;margin-bottom:1em;" />'
             content = cover_tag + content
@@ -118,30 +115,32 @@ def fetch_full_text(url: str, cover_url: str = "") -> str:
     except Exception:
         return ""
 
-def build_full_feed(feed_url: str, force_refresh: bool = False) -> str:
+async def build_full_feed_async(feed_url: str, force_refresh: bool = False) -> str:
     if not force_refresh and feed_url in cache:
         return cache[feed_url]
 
     feed = feedparser.parse(feed_url)
+    entries = feed.entries[:5]  # max 5 articoli
+
+    async with httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0 (RSS fulltext fetcher)"}) as client:
+        # Scarica tutti gli articoli in parallelo
+        tasks = [
+            fetch_full_text_async(client, entry.get("link", ""), get_entry_image(entry))
+            for entry in entries
+        ]
+        results = await asyncio.gather(*tasks)
 
     items_xml = []
-    for entry in feed.entries[:20]:
+    for entry, scraped in zip(entries, results):
         title = entry.get("title", "")
         link  = entry.get("link", "")
         pub   = entry.get("published",
                           datetime.utcnow().strftime("%a, %d %b %Y %H:%M:%S +0000"))
 
         cover_url = get_entry_image(entry)
+        existing  = entry.get("content", [{}])[0].get("value", "") or entry.get("summary", "")
+        content   = scraped if scraped else existing
 
-        existing = entry.get("content", [{}])[0].get("value", "") or entry.get("summary", "")
-        existing_text = BeautifulSoup(existing, "html.parser").get_text(strip=True)
-
-        # Scrapa sempre: anche se il feed ha del testo, potrebbe essere troncato.
-        # Usiamo il contenuto del feed solo se lo scraping fallisce completamente.
-        scraped = fetch_full_text(link, cover_url)
-        content = scraped if scraped else existing
-
-        # Se il feed ha un'immagine e non è già nel contenuto, aggiungila
         if cover_url and cover_url not in content:
             cover_tag = f'<img src="{cover_url}" style="max-width:100%;margin-bottom:1em;" />'
             content = cover_tag + content
@@ -171,6 +170,9 @@ def build_full_feed(feed_url: str, force_refresh: bool = False) -> str:
 
     cache[feed_url] = result
     return result
+
+def build_full_feed(feed_url: str, force_refresh: bool = False) -> str:
+    return asyncio.run(build_full_feed_async(feed_url, force_refresh))
 
 @app.route("/")
 def index():
